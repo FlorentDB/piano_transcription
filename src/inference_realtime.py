@@ -206,8 +206,8 @@ def main():
     
     parser.add_argument('--model_path', type=str, required=True,
                         help='Path to trained model checkpoint (.pt file)')
-    parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'],
-                        help='Inference device')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', 
+                        choices=['cuda', 'cpu'], help='Inference device (auto-detected)')
     parser.add_argument('--sample_rate', type=int, default=16000,
                         help='Audio sample rate (must match training)')
     parser.add_argument('--list_devices', action='store_true',
