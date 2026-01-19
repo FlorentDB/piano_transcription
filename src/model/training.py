@@ -9,7 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 import os
 import signal
-from model import PARModel
+from model.model import PARModel
 from torch.cuda.amp import GradScaler, autocast  # NEW: For mixed precision
 
 # --- H5 Dataset Logic (unchanged) ---

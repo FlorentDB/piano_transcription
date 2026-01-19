@@ -2,7 +2,7 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 import numpy as np
-from model import PARModel
+from model.model import PARModel
 from audio_processor import AudioProcessor, get_key
 import argparse
 import time
