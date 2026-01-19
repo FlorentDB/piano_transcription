@@ -361,18 +361,3 @@ class PARModel(nn.Module):
         return torch.zeros(batch_size, self.n_pitches, 3, device=device)
 
     
-# Création
-model = PARModel(cnn_channels=48, hidden_size=768, lstm_units=48, hidden_unit_per_pitch=188)
-
-# Affichage structure
-print(model)
-
-
-# Calculer le nombre de paramètres par couche
-for name, param in model.named_parameters():
-    if param.requires_grad:
-        print(f"Layer: {name} | Parameters: {param.numel()}")
-
-# Paramètre totaux
-total_params = sum(p.numel() for p in model.parameters())
-print(f"\nTotal parameters: {total_params:,}")
