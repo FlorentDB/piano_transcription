@@ -30,10 +30,19 @@ class RealtimeTranscription:
         
         # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         else:
-            self.model.load_state_dict(checkpoint)
-            
+            state_dict = checkpoint
+        
+        # Remove '_orig_mod.' prefix if present (from torch.compile)
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {
+                key.replace('_orig_mod.', ''): value 
+                for key, value in state_dict.items()
+            }
+            print("Removed '_orig_mod.' prefix from compiled model checkpoint")
+        
+        self.model.load_state_dict(state_dict)
         self.model.eval()
         self.model.to(device)
         
