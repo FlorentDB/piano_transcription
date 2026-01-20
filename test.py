@@ -1,6 +1,7 @@
-import pyaudio
+import numpy as np
 
-p = pyaudio.PyAudio()
-for i in range(p.get_device_count()):
-    info = p.get_device_info_by_index(i)
-    print(f"{i}: {info['name']} (inputs: {info['maxInputChannels']})")
+# Load the .npy file
+data = np.load('checkpoints/losses.npy', allow_pickle=True)
+
+# Print the data
+print(data)

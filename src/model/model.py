@@ -129,13 +129,11 @@ class AcousticModule(nn.Module):
 
 class RecursiveContextNet(nn.Module):
     """
-    Enhanced Recursive Context with TWO hidden layers as described in paper:
-    "embedded with two layers of small fully connected layer with 16 units,
-    and projected into 4 dimension with a linear layer"
+    Paper specification: "embedded with two layers of small fully connected layer 
+    with 16 units, and projected into 4 dimension with a linear layer"
     """
     def __init__(self, hidden_dim=16, out_dim=4):
         super().__init__()
-        # Two FC layers with 16 units: 3 → 16 → ReLU → 16 → ReLU → 4
         self.fc1 = nn.Linear(3, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, out_dim)
@@ -144,7 +142,6 @@ class RecursiveContextNet(nn.Module):
         """
         Args:
             context_input: (B, 88, 3) - [state, duration, velocity] per pitch
-                         duration and velocity should be normalized [0,1]
         Returns:
             (B, 88, 4) - embedded context vector
         """
@@ -155,15 +152,14 @@ class RecursiveContextNet(nn.Module):
 
 class NoteStateSequenceModule(nn.Module):
     """
-    Note State Sequence Module with teacher forcing support.
+    FIXED: Proper teacher forcing implementation matching the paper.
     """
     def __init__(self, hidden_unit_per_pitch=188, lstm_units=48):
         super().__init__()
         self.hidden_unit_per_pitch = hidden_unit_per_pitch
         self.lstm_units = lstm_units
-        self.n_states = 5  # onset, re-onset, sustain, offset, off
+        self.n_states = 5
         
-        # Enhanced recursive context encoder
         self.context_net = RecursiveContextNet(hidden_dim=16, out_dim=4)
         
         # Pitch-wise LSTMs (parameter shared)
@@ -173,75 +169,96 @@ class NoteStateSequenceModule(nn.Module):
         # Timewise FC to 5 states
         self.fc_states = nn.Linear(lstm_units, self.n_states)
         
-    def forward_step(self, pitch_features_t, prev_context):
-        """
-        Single step forward for autoregressive inference.
-        
-        Args:
-            pitch_features_t: (B, 88, H) - acoustic features at time t
-            prev_context: (B, 88, 3) - [state, duration, velocity] from previous frame
-        Returns:
-            state_logits_t: (B, 88, 5) - logits for state prediction
-            context_emb_t: (B, 88, 4) - embedded context for next step
-        """
-        # Encode recursive context: (B, 88, 3) -> (B, 88, 4)
-        context_emb = self.context_net(prev_context)  # (B, 88, 4)
-        
-        # Concatenate with pitch features: (B, 88, H+4)
-        x = torch.cat([pitch_features_t, context_emb], dim=2)  # (B, 88, H+4)
-        
-        # Reshape for LSTM: (88, B, H+4)
-        x = x.permute(1, 0, 2)  # (88, B, H+4)
-        
-        # Two LSTM layers
-        x, _ = self.lstm1(x)  # (88, B, lstm_units)
-        x, _ = self.lstm2(x)  # (88, B, lstm_units)
-        
-        # Timewise FC to 5 states: (88, B, 5)
-        x = self.fc_states(x)
-        
-        # Reshape back: (B, 88, 5)
-        state_logits = x.permute(1, 0, 2)  # (B, 88, 5)
-        
-        return state_logits, context_emb
-        
     def forward(self, pitch_features, prev_context, teacher_forcing=True, target_states=None):
         """
+        FIXED: Proper autoregressive implementation with teacher forcing.
+        
         Args:
             pitch_features: (B, 88, H, T) - from acoustic module
-            prev_context: (B, 88, 3) - initial context (all zeros for first frame)
-            teacher_forcing: bool - whether to use ground truth context
+            prev_context: (B, 88, 3) - initial context [state, duration, velocity]
+            teacher_forcing: bool - whether to use ground truth states
             target_states: (B, 88, T) - ground truth states for teacher forcing
         Returns:
             state_probs: (B, 88, 5, T) - softmax probabilities over 5 states
         """
         B, num_pitches, H, T = pitch_features.shape
+        device = pitch_features.device
         
-        # List to store outputs at each timestep
+        # Initialize LSTM hidden states (shared across all pitches)
+        h1 = torch.zeros(1, B * 88, self.lstm_units, device=device)
+        c1 = torch.zeros(1, B * 88, self.lstm_units, device=device)
+        h2 = torch.zeros(1, B * 88, self.lstm_units, device=device)
+        c2 = torch.zeros(1, B * 88, self.lstm_units, device=device)
+        
+        # Track context for autoregressive generation
+        current_context = prev_context.clone()  # (B, 88, 3)
+        
+        # Storage for outputs
         state_logits_list = []
-        context_emb_list = []
         
-        # Current context for autoregressive generation
-        current_context = prev_context
+        # Maximum duration for normalization (5 seconds at 31.25 fps = ~156 frames)
+        max_duration_frames = 156.0
         
         for t in range(T):
             # Get features at time t: (B, 88, H)
-            pitch_features_t = pitch_features[..., t]
+            pitch_features_t = pitch_features[:, :, :, t]  # (B, 88, H)
             
-            # Forward step
-            state_logits_t, context_emb_t = self.forward_step(pitch_features_t, current_context)
+            # Encode recursive context: (B, 88, 3) -> (B, 88, 4)
+            context_emb = self.context_net(current_context)  # (B, 88, 4)
+            
+            # Concatenate with pitch features: (B, 88, H+4)
+            x = torch.cat([pitch_features_t, context_emb], dim=2)  # (B, 88, H+4)
+            
+            # Reshape for pitch-wise LSTM: (1, B*88, H+4)
+            x = x.reshape(1, B * 88, H + 4)
+            
+            # Two LSTM layers with shared parameters
+            x, (h1, c1) = self.lstm1(x, (h1, c1))  # (1, B*88, lstm_units)
+            x, (h2, c2) = self.lstm2(x, (h2, c2))  # (1, B*88, lstm_units)
+            
+            # Predict states: (1, B*88, 5)
+            state_logits_t = self.fc_states(x)  # (1, B*88, 5)
+            
+            # Reshape back: (B, 88, 5)
+            state_logits_t = state_logits_t.reshape(B, 88, 5)
             state_logits_list.append(state_logits_t)
-            context_emb_list.append(context_emb_t)
             
-            # Update context for next step
-            if teacher_forcing and target_states is not None:
-                # Use ground truth states for next context
-                # Extract state, duration, velocity from target_states
-                # This requires additional processing - for now using predicted states
-                pass
-            
-            # During inference or without teacher forcing: use predicted states
-            # For now, we need to compute the next context from predictions
+            # FIXED: Update context for next timestep
+            if t < T - 1:  # Don't update after last frame
+                if teacher_forcing and target_states is not None:
+                    # Use ground truth states (TEACHER FORCING)
+                    next_states = target_states[:, :, t]  # (B, 88)
+                else:
+                    # Use predicted states (INFERENCE)
+                    next_states = torch.argmax(state_logits_t, dim=2)  # (B, 88)
+                
+                # Update context based on state transitions
+                for b in range(B):
+                    for pitch in range(88):
+                        state = next_states[b, pitch].item()
+                        
+                        if state == 1 or state == 2:  # onset or re-onset
+                            current_context[b, pitch, 0] = float(state)  # state
+                            current_context[b, pitch, 1] = 1.0 / max_duration_frames  # duration (normalized)
+                            current_context[b, pitch, 2] = 0.5  # velocity (will be replaced with actual)
+                            
+                        elif state == 3:  # sustain
+                            current_context[b, pitch, 0] = 3.0
+                            # Increment duration
+                            current_duration = current_context[b, pitch, 1] * max_duration_frames
+                            current_duration = min(current_duration + 1.0, max_duration_frames)
+                            current_context[b, pitch, 1] = current_duration / max_duration_frames
+                            # velocity stays the same
+                            
+                        elif state == 4:  # offset
+                            current_context[b, pitch, 0] = 4.0
+                            current_context[b, pitch, 1] = 0.0  # reset duration
+                            current_context[b, pitch, 2] = 0.0  # reset velocity
+                            
+                        else:  # off (state 0)
+                            current_context[b, pitch, 0] = 0.0
+                            current_context[b, pitch, 1] = 0.0
+                            current_context[b, pitch, 2] = 0.0
         
         # Stack outputs: (B, 88, 5, T)
         state_logits = torch.stack(state_logits_list, dim=-1)
@@ -250,6 +267,7 @@ class NoteStateSequenceModule(nn.Module):
         state_probs = F.softmax(state_logits, dim=2)
         
         return state_probs
+
 
 class VelocityModel(nn.Module):
     """

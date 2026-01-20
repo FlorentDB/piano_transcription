@@ -134,6 +134,7 @@ def create_dataloaders(
 
 # --- Loss Functions (unchanged) ---
 class FocalLoss(nn.Module):
+    """Paper: focal loss with α=1.0, γ=2.0"""
     def __init__(self, alpha=1.0, gamma=2.0):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
@@ -152,18 +153,22 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 class VelocityLoss(nn.Module):
+    """Paper: L2 loss only on onset frames"""
     def __init__(self):
         super(VelocityLoss, self).__init__()
         self.mse = nn.MSELoss(reduction='none')
 
     def forward(self, pred_velocities, true_velocities, states):
-        onset_mask = ((states == 1) | (states == 3)).float()
+        # Only compute loss on onset frames (state 1 or 2)
+        onset_mask = ((states == 1) | (states == 2)).float()
+        pred_velocities = pred_velocities.squeeze(2)  # (B, 88, T)
         loss = self.mse(pred_velocities, true_velocities)
         loss = (loss * onset_mask).sum() / (onset_mask.sum() + 1e-8)
         return loss
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, test_loader, device, learning_rate=1e-3, 
+    def __init__(self, model, train_loader, val_loader, test_loader, device, 
+                 learning_rate=1e-3,  # Paper uses 1e-3
                  max_iterations=250000, checkpoint_dir='checkpoints', checkpoint_every=5000):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -171,9 +176,14 @@ class Trainer:
         self.test_loader = test_loader
         self.device = device
         self.max_iterations = max_iterations
+        
+        # Paper: focal loss with α=1.0, γ=2.0
         self.note_loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
         self.velocity_loss_fn = VelocityLoss()
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate, fused=True)  # NEW: fused=True for faster Adam
+        
+        # Paper uses Adam (no mention of AdamW)
+        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate, fused=True)
+        
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.best_val_loss = float('inf')
@@ -182,15 +192,11 @@ class Trainer:
         self.val_losses = []
         self.checkpoint_every = checkpoint_every
         self.interrupted = False
-        
-        # NEW: Mixed precision scaler
         self.scaler = GradScaler()
         
-        # NEW: Signal handling for graceful exit
         signal.signal(signal.SIGINT, self._handle_interrupt)
         signal.signal(signal.SIGTERM, self._handle_interrupt)
         
-        # NEW: Torch compile for PyTorch 2.0+
         if hasattr(torch, 'compile'):
             self.model = torch.compile(self.model)
         
@@ -202,48 +208,72 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        epoch_losses = []  # NEW: Store per-batch losses for better logging
         
         pbar = tqdm(self.train_loader, desc='Training', leave=False)
         
-        for mel_spec, state_labels, context in pbar:
+        for mel_spec, state_labels, initial_context in pbar:
             if self.interrupted:
                 print("Training interrupted mid-epoch. Saving progress...")
                 break
                 
             mel_spec = mel_spec.to(self.device, non_blocking=True)
             state_labels = state_labels.to(self.device, non_blocking=True)
-            context = context.to(self.device, non_blocking=True)
+            initial_context = initial_context.to(self.device, non_blocking=True)
             
-            # NEW: Mixed precision forward pass
+            B, num_pitches, T = state_labels.shape
+            
+            # TEMPORARY: Generate dummy velocities
+            # TODO: Extract actual velocities from HDF5 onset metadata
+            true_velocities = torch.zeros((B, num_pitches, T), device=self.device)
+            # For onset frames, set velocity to 0.5 (normalized from ~64/127)
+            onset_mask = ((state_labels == 1) | (state_labels == 2))
+            true_velocities[onset_mask] = 0.5
+            
             with autocast():
-                state_probs, velocities = self.model(mel_spec, context)
-                loss = self.note_loss_fn(state_probs, state_labels)
+                # FIXED: Teacher forcing enabled during training
+                state_probs, pred_velocities = self.model(
+                    mel_spec, 
+                    initial_context,
+                    teacher_forcing=True,  # Use ground truth states
+                    target_states=state_labels
+                )
+                
+                # Compute losses
+                note_loss = self.note_loss_fn(state_probs, state_labels)
+                velocity_loss = self.velocity_loss_fn(pred_velocities, true_velocities, state_labels)
+                
+                # Combined loss (paper trains both jointly)
+                loss = note_loss + velocity_loss
             
-            # NEW: Mixed precision backward pass
+            # Mixed precision training
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
+            
+            # Paper uses gradient clipping with max_norm=5.0
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)  # NEW: More efficient than zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             
             loss_item = loss.item()
             total_loss += loss_item
             num_batches += 1
             self.iteration += 1
             
-            epoch_losses.append(loss_item)
-            pbar.set_postfix({'loss': f'{loss_item:.4f}', 'iter': self.iteration})
+            pbar.set_postfix({
+                'loss': f'{loss_item:.4f}',
+                'note': f'{note_loss.item():.4f}',
+                'vel': f'{velocity_loss.item():.4f}',
+                'iter': self.iteration
+            })
             
-            # NEW: Save latest checkpoint periodically (not just at epoch end)
             if self.iteration % self.checkpoint_every == 0:
                 self.save_checkpoint('latest_model.pt', include_losses=True)
             
             if self.iteration >= self.max_iterations:
                 break
         
-        # Calculate average loss for this epoch
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         self.train_losses.append(avg_loss)
         return avg_loss
@@ -254,15 +284,27 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            # NEW: Use autocast for validation too
-            for mel_spec, state_labels, context in tqdm(self.val_loader, desc='Validation', leave=False):
+            for mel_spec, state_labels, initial_context in tqdm(self.val_loader, desc='Validation', leave=False):
                 mel_spec = mel_spec.to(self.device, non_blocking=True)
                 state_labels = state_labels.to(self.device, non_blocking=True)
-                context = context.to(self.device, non_blocking=True)
+                initial_context = initial_context.to(self.device, non_blocking=True)
+                
+                B, num_pitches, T = state_labels.shape
+                true_velocities = torch.zeros((B, num_pitches, T), device=self.device)
+                onset_mask = ((state_labels == 1) | (state_labels == 2))
+                true_velocities[onset_mask] = 0.5
                 
                 with autocast():
-                    state_probs, velocities = self.model(mel_spec, context)
-                    loss = self.note_loss_fn(state_probs, state_labels)
+                    # FIXED: No teacher forcing during validation
+                    state_probs, pred_velocities = self.model(
+                        mel_spec,
+                        initial_context,
+                        teacher_forcing=False  # Use predictions
+                    )
+                    
+                    note_loss = self.note_loss_fn(state_probs, state_labels)
+                    velocity_loss = self.velocity_loss_fn(pred_velocities, true_velocities, state_labels)
+                    loss = note_loss + velocity_loss
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -272,21 +314,27 @@ class Trainer:
         return avg_loss
     
     def test(self):
-        """NEW: Final test evaluation"""
         print("\nRunning final test evaluation...")
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
         
         with torch.no_grad():
-            for mel_spec, state_labels, context in tqdm(self.test_loader, desc='Testing'):
+            for mel_spec, state_labels, initial_context in tqdm(self.test_loader, desc='Testing'):
                 mel_spec = mel_spec.to(self.device, non_blocking=True)
                 state_labels = state_labels.to(self.device, non_blocking=True)
-                context = context.to(self.device, non_blocking=True)
+                initial_context = initial_context.to(self.device, non_blocking=True)
+                
+                B, num_pitches, T = state_labels.shape
+                true_velocities = torch.zeros((B, num_pitches, T), device=self.device)
+                onset_mask = ((state_labels == 1) | (state_labels == 2))
+                true_velocities[onset_mask] = 0.5
                 
                 with autocast():
-                    state_probs, velocities = self.model(mel_spec, context)
-                    loss = self.note_loss_fn(state_probs, state_labels)
+                    state_probs, pred_velocities = self.model(mel_spec, initial_context, teacher_forcing=False)
+                    note_loss = self.note_loss_fn(state_probs, state_labels)
+                    velocity_loss = self.velocity_loss_fn(pred_velocities, true_velocities, state_labels)
+                    loss = note_loss + velocity_loss
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -301,7 +349,7 @@ class Trainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'scaler_state_dict': self.scaler.state_dict(),  # NEW: Save scaler state
+            'scaler_state_dict': self.scaler.state_dict(),
         }
         
         if include_losses:
@@ -313,7 +361,6 @@ class Trainer:
         print(f"Checkpoint saved: {path}")
 
     def load_checkpoint(self, filename):
-        """NEW: Load checkpoint to resume training"""
         path = self.checkpoint_dir / filename
         if not path.exists():
             print(f"No checkpoint found at {path}, starting from scratch...")
@@ -347,7 +394,6 @@ class Trainer:
         print(f"Training batches per epoch: {len(self.train_loader)}")
         print(f"Validation batches: {len(self.val_loader)}")
         
-        # Try to resume if requested
         if resume:
             self.load_checkpoint('latest_model.pt')
         
@@ -360,30 +406,21 @@ class Trainer:
                 actual_epoch = start_epoch + epoch
                 print(f"\n=== Epoch {actual_epoch} (Iteration {self.iteration:,}) ===")
                 
-                # TRAIN FIRST
                 avg_train_loss = self.train_epoch()
                 print(f"Average training loss: {avg_train_loss:.4f}")
                 
-                # THEN VALIDATE
                 val_loss = self.validate()
                 print(f"Validation Loss: {val_loss:.4f} (Best: {self.best_val_loss:.4f})")
                 
-                # Save best model
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.save_checkpoint('best_model.pt')
                     print("New best model saved!")
                 
-                # Save epoch checkpoint
                 if epoch % 5 == 0:
                     self.save_checkpoint(f'checkpoint_epoch_{actual_epoch}.pt')
                 
-                # Always save latest state
                 self.save_checkpoint('latest_model.pt', include_losses=True)
-                
-                # Early stopping check (optional)
-                if len(self.val_losses) > 10 and val_loss > min(self.val_losses[-10:]):
-                    print("No improvement in 10 epochs, consider early stopping")
         
         except Exception as e:
             print(f"\nTraining crashed with error: {e}")
@@ -391,7 +428,6 @@ class Trainer:
             raise
         
         finally:
-            # Save final state regardless of how training ended
             self.save_checkpoint('latest_model.pt', include_losses=True)
             
             if self.interrupted:
@@ -399,36 +435,35 @@ class Trainer:
                 print("Run with resume=True to continue from the last checkpoint.")
             else:
                 print("\nTraining completed successfully!")
-                # FINAL TEST EVALUATION
                 self.test()
             
-            # Save final losses
             self.save_losses()
 
-# --- Main Function (updated) ---
 def main(resume=False):
+    """Paper-exact configuration"""
     config = {
         'data_dir': 'dataset/preprocessed_dataset.h5',
-        'batch_size': 12,  # DRAMATICALLY INCREASED from 4
-        'learning_rate': 1e-3,
+        'batch_size': 12,  # Paper uses batch size 12
+        'learning_rate': 1e-3,  # Paper uses 1e-3 with Adam
         'max_iterations': 250000,
-        'num_workers': 8,  # INCREASED for better data loading
-        'sequence_length': 312,
+        'num_workers': 8,
+        'sequence_length': 312,  # ~10 seconds at 31.25 fps
         'checkpoint_dir': 'checkpoints',
-        'checkpoint_every': 5000,  # NEW: Save every 5000 iterations
+        'checkpoint_every': 5000,
     }
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # NEW: Print GPU info
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
-    # Enable benchmark mode for better performance
     torch.backends.cudnn.benchmark = True
 
+    # Import your fixed dataset loader
+    from dataset_loader import create_dataloaders
+    
     train_loader, val_loader, test_loader = create_dataloaders(
         data_dir=config['data_dir'],
         batch_size=config['batch_size'],
@@ -440,9 +475,10 @@ def main(resume=False):
     print(f"Validation batches: {len(val_loader)}")
     print(f"Test batches: {len(test_loader)}")
 
-    model = PARModel()
+    # Import your fixed model
+    from model.model import PARModel
     
-    # NEW: Move model to device before counting parameters
+    model = PARModel()
     model = model.to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
@@ -451,7 +487,7 @@ def main(resume=False):
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        test_loader=test_loader,  # NEW: Pass test_loader
+        test_loader=test_loader,
         device=device,
         learning_rate=config['learning_rate'],
         max_iterations=config['max_iterations'],
@@ -461,7 +497,6 @@ def main(resume=False):
     trainer.train(resume=resume)
 
 if __name__ == "__main__":
-    # NEW: Parse resume from command line
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', action='store_true', help='Resume from latest checkpoint')
